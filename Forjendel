@@ -1,0 +1,965 @@
+repeat
+	task.wait()
+until game:IsLoaded()
+task.wait(3)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local TeleportService = game:GetService("TeleportService")
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local LocalPlayer = Players.LocalPlayer
+local SharedModules = ReplicatedStorage:WaitForChild("SharedModules")
+local Packet = SharedModules:WaitForChild("Packet")
+local RemoteEvent = Packet:WaitForChild("RemoteEvent")
+local Networking = require(SharedModules:WaitForChild("Networking"))
+local Gardens = workspace:WaitForChild("Gardens")
+
+-- [ ตั้งค่าตรงนี้ ] --
+local TARGET_OWNER_NAME = { _G.TargetOwner or "ใส่ชื่อไว้ตรงนี้หำน้อย" }
+local TARGET_PLANT_NAME = "Dragon's Breath" 
+local SPRINKLER_NAME = "Super Sprinkler"
+local WATERING_CAN_NAME = "Super Watering Can"
+local WATER_INTERVAL = 3
+local SPRINKLER_CHECK_INTERVAL = 1
+local REJOIN_RETRY_DELAY = 1
+local TOOL_WAIT_TIMEOUT = 8
+local CHARACTER_WAIT_TIMEOUT = 15
+local RESPAWN_GRACE_SECONDS = 5
+local RESPAWN_STAND_WAIT_SECONDS = 120
+local TWEEN_REACHED_DISTANCE = 8
+local TWEEN_MAX_SECONDS_PER_MOVE = 45
+local PLACE_OFFSET_DISTANCE = 3
+local LOG_PREFIX = "[QuutDragonBreathSuperLoop]"
+local CLICK_DELAY = 0.9 -- ดีเลย์ของ Auto Clicker
+
+local ranStatus = false
+local countdownThread = nil
+local rejoinDelay = 60 
+
+if _G.QuutDragonBreathSuperLoop then
+	_G.QuutDragonBreathSuperLoop.Running = false
+	for _, connection in ipairs(_G.QuutDragonBreathSuperLoop.Connections or {}) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+end
+
+local State = {
+	Running = true,
+	Rejoining = false,
+	Connections = {},
+	TargetPlot = nil,
+	TargetPlant = nil,
+	TargetPosition = nil,
+	WalkPosition = nil,
+	SelectedOwnerName = nil,
+	LastStatus = "",
+	ResetToken = 0,
+	ResumeAfter = 0,
+	StandWaitUntil = 0,
+	IsBusy = false -- ตัวแปรเช็คว่าฟาร์มกำลังทำงานอยู่ไหม (ถ้า true = หยุดคลิก)
+}
+_G.QuutDragonBreathSuperLoop = State
+
+----------------------------------------------------------------
+--- UI SETUP (Fluent & Indicator)
+----------------------------------------------------------------
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
+local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
+
+local Window = Fluent:CreateWindow({
+	Title = "Fluent " .. Fluent.Version,
+	SubTitle = "by dawid",
+	TabWidth = 160,
+	Size = UDim2.fromOffset(580, 460),
+	Acrylic = true,
+	Theme = "Dark",
+	MinimizeKey = Enum.KeyCode.LeftControl
+})
+
+local Tabs = {
+	Main = Window:AddTab({ Title = "Main", Icon = "" }),
+	Settings = Window:AddTab({ Title = "Settings", Icon = "settings" })
+}
+
+local Options = Fluent.Options
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "AutoClickerIndicator"
+ScreenGui.ResetOnSpawn = false
+local success, err = pcall(function()
+	screenGui.Parent = CoreGui
+end)
+if not success then
+	screenGui.Parent = CoreGui:FindFirstChild("RobloxGui") or CoreGui or LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- UI Control Frame
+local ButtonFrame = Instance.new("Frame")
+ButtonFrame.Name = "ShortcutFrame"
+ButtonFrame.Size = UDim2.new(0, 110, 0, 120)
+ButtonFrame.Position = UDim2.new(1, -120, 0, 150) -- มุมบนขวา
+ButtonFrame.BackgroundTransparency = 1
+ButtonFrame.Parent = ScreenGui
+
+local CountdownLabel = Instance.new("TextLabel")
+CountdownLabel.Name = "CountdownTimerDisplay"
+CountdownLabel.Size = UDim2.new(1, 0, 0, 30)
+CountdownLabel.Position = UDim2.new(0, 0, 0, 0)
+CountdownLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+CountdownLabel.BackgroundTransparency = 0.3
+CountdownLabel.Text = "WAITING..."
+CountdownLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+CountdownLabel.Font = Enum.Font.SourceSansBold
+CountdownLabel.TextSize = 14
+CountdownLabel.Parent = ButtonFrame
+
+local UICorner3 = Instance.new("UICorner")
+UICorner3.CornerRadius = UDim.new(0, 6)
+UICorner3.Parent = CountdownLabel
+
+local UIStroke = Instance.new("UIStroke")
+UIStroke.Color = Color3.fromRGB(60, 60, 60)
+UIStroke.Thickness = 1
+UIStroke.Parent = CountdownLabel
+
+local ToggleBtn = Instance.new("TextButton")
+ToggleBtn.Name = "RollbackToggle"
+ToggleBtn.Size = UDim2.new(1, 0, 0, 40)
+ToggleBtn.Position = UDim2.new(0, 0, 0, 35)
+ToggleBtn.BackgroundColor3 = Color3.fromRGB(240, 78, 78)
+ToggleBtn.Text = "Rollback: OFF"
+ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ToggleBtn.Font = Enum.Font.SourceSansBold
+ToggleBtn.TextSize = 14
+ToggleBtn.Parent = ButtonFrame
+
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0, 8)
+UICorner.Parent = ToggleBtn
+
+local RejoinBtn = Instance.new("TextButton")
+RejoinBtn.Name = "RejoinShortcut"
+RejoinBtn.Size = UDim2.new(1, 0, 0, 40)
+RejoinBtn.Position = UDim2.new(0, 0, 0, 80)
+RejoinBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+RejoinBtn.BackgroundTransparency = 0.2
+RejoinBtn.Text = "REJOIN 🔄"
+RejoinBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+RejoinBtn.Font = Enum.Font.SourceSansBold
+RejoinBtn.TextSize = 16
+RejoinBtn.Parent = ButtonFrame
+
+local UICorner2 = Instance.new("UICorner")
+UICorner2.CornerRadius = UDim.new(0, 8)
+UICorner2.Parent = RejoinBtn
+
+-- Auto Clicker Indicator (จุดเขียว-แดงบอกสถานะการคลิก)
+local indicator = Instance.new("Frame")
+indicator.Size = UDim2.new(0, 16, 0, 16)
+indicator.Position = UDim2.new(0, 5, 0, 7)
+indicator.BackgroundColor3 = Color3.fromRGB(255, 78, 78)
+indicator.BorderSizePixel = 0
+indicator.Parent = CountdownLabel
+
+local uiCornerInd = Instance.new("UICorner")
+uiCornerInd.CornerRadius = UDim.new(1, 0)
+uiCornerInd.Parent = indicator
+
+-- Drag System
+local dragging, dragInput, dragStart, startPos
+local function updateInput(input)
+	local delta = input.Position - dragStart
+	ButtonFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+end
+
+local function setupDrag(button)
+	button.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true; dragStart = input.Position; startPos = ButtonFrame.Position
+			input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then dragging = false end end)
+		end
+	end)
+	button.InputChanged:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then dragInput = input end end)
+end
+
+setupDrag(ToggleBtn)
+setupDrag(RejoinBtn)
+setupDrag(CountdownLabel)
+
+UserInputService.InputChanged:Connect(function(input)
+	if input == dragInput and dragging then updateInput(input) end
+end)
+
+----------------------------------------------------------------
+--- UTILITY FUNCTIONS
+----------------------------------------------------------------
+local function log(...)
+	print(LOG_PREFIX, ...)
+end
+
+local Status = Tabs.Main:AddParagraph({ Title = "Status : Off 🔴", })
+
+local function setStatus(message)
+	message = tostring(message or "")
+	if State.LastStatus ~= message then
+		State.LastStatus = message
+		log(message)
+	end
+end
+
+local function normalize(value)
+	return tostring(value or ""):lower():gsub("%s+", ""):gsub("[^%w]", "")
+end
+
+local function normalizedContains(value, wanted)
+	local normalized = normalize(value)
+	wanted = normalize(wanted)
+	return normalized ~= "" and wanted ~= "" and (normalized == wanted or normalized:find(wanted, 1, true) ~= nil)
+end
+
+local function getTargetOwnerNames()
+	if type(TARGET_OWNER_NAME) == "table" then return TARGET_OWNER_NAME end
+	return { TARGET_OWNER_NAME }
+end
+
+local function getActiveOwnerNames()
+	if type(State.SelectedOwnerName) == "string" and State.SelectedOwnerName ~= "" then
+		return { State.SelectedOwnerName }
+	end
+	return getTargetOwnerNames()
+end
+
+local function getOwnerLabel()
+	if type(State.SelectedOwnerName) == "string" and State.SelectedOwnerName ~= "" then
+		return State.SelectedOwnerName
+	end
+	return table.concat(getTargetOwnerNames(), ", ")
+end
+
+local function lockSelectedOwner(ownerName)
+	ownerName = tostring(ownerName or "")
+	if ownerName == "" or State.SelectedOwnerName then return end
+	State.SelectedOwnerName = ownerName
+	log("selected owner:", ownerName)
+end
+
+local function triggerRejoin(reason)
+	if State.Rejoining then return end
+	State.Rejoining = true
+	log("rejoining:", tostring(reason or "requested"))
+	task.spawn(function()
+		while State.Running do
+			pcall(function()
+				TeleportService:Teleport(game.PlaceId, LocalPlayer)
+			end)
+			task.wait(REJOIN_RETRY_DELAY)
+		end
+	end)
+end
+
+local function connect(signal, callback)
+	local connection = signal:Connect(callback)
+	table.insert(State.Connections, connection)
+	return connection
+end
+
+local function resetLogic(reason)
+	State.ResetToken += 1
+	State.TargetPlot = nil
+	State.TargetPlant = nil
+	State.TargetPosition = nil
+	State.WalkPosition = nil
+	State.LastStatus = ""
+	State.ResumeAfter = os.clock() + RESPAWN_GRACE_SECONDS
+	State.StandWaitUntil = State.ResumeAfter + RESPAWN_STAND_WAIT_SECONDS
+	log("reset:", tostring(reason or "character changed"))
+end
+
+local function inRespawnGrace() return os.clock() < (State.ResumeAfter or 0) end
+local function inRespawnStandWait() return os.clock() >= (State.ResumeAfter or 0) and os.clock() < (State.StandWaitUntil or 0) end
+local function inRespawnHold() return inRespawnGrace() or inRespawnStandWait() end
+
+local function getBackpack(timeout)
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+	local deadline = os.clock() + math.max(tonumber(timeout) or 0, 0)
+	while not backpack and State.Running and os.clock() < deadline do
+		task.wait(0.1)
+		backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+	end
+	return backpack
+end
+
+local function getCharacter(timeout)
+	local character = LocalPlayer.Character
+	local deadline = os.clock() + math.max(tonumber(timeout) or 0, 0)
+	while not character and State.Running and os.clock() < deadline do
+		task.wait(0.1)
+		character = LocalPlayer.Character
+	end
+	return character
+end
+
+local function getHumanoid(character, timeout)
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local deadline = os.clock() + math.max(tonumber(timeout) or 0, 0)
+	while not humanoid and State.Running and os.clock() < deadline do
+		task.wait(0.1)
+		character = character or LocalPlayer.Character
+		humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	end
+	return humanoid
+end
+
+local function getRootPart(character, timeout)
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local deadline = os.clock() + math.max(tonumber(timeout) or 0, 0)
+	while not root and State.Running and os.clock() < deadline do
+		task.wait(0.1)
+		character = character or LocalPlayer.Character
+		root = character and character:FindFirstChild("HumanoidRootPart")
+	end
+	return root
+end
+
+local function getToolCount(tool)
+	for _, attrName in ipairs({ "Count", "Amount", "Quantity" }) do
+		local count = tonumber(tool:GetAttribute(attrName))
+		if count ~= nil then return count end
+	end
+	return nil
+end
+
+local function toolHasStock(tool)
+	local count = getToolCount(tool)
+	return count == nil or count > 0
+end
+
+local function toolMatches(tool, attributeName, itemName)
+	if not (tool and tool:IsA("Tool")) then return false end
+	if tool:GetAttribute(attributeName) == itemName then return true end
+	if normalizedContains(tool.Name, itemName) then return true end
+	local attrValue = tool:GetAttribute(attributeName)
+	return attrValue ~= nil and normalizedContains(attrValue, itemName)
+end
+
+local function findTool(attributeName, itemName, timeout)
+	local deadline = os.clock() + math.max(tonumber(timeout) or 0, 0)
+	local function scan()
+		local containers = { LocalPlayer.Character, getBackpack(0) }
+		for _, container in ipairs(containers) do
+			if container then
+				for _, descendant in ipairs(container:GetDescendants()) do
+					if toolMatches(descendant, attributeName, itemName) and toolHasStock(descendant) then
+						return descendant
+					end
+				end
+			end
+		end
+	end
+	local tool = scan()
+	if tool then return tool end
+	while State.Running and os.clock() < deadline do
+		task.wait(0.15)
+		tool = scan()
+		if tool then return tool end
+	end
+	return nil
+end
+
+local function requireToolOrRejoin(attributeName, itemName)
+	if inRespawnHold() then return nil end
+	local tool = findTool(attributeName, itemName, TOOL_WAIT_TIMEOUT)
+	if not tool then
+		triggerRejoin(itemName .. " depleted")
+		return nil
+	end
+	return tool
+end
+
+local function equipTool(tool)
+	if not tool then return false end
+	local character = getCharacter(CHARACTER_WAIT_TIMEOUT)
+	if not character then return false end
+	if tool.Parent == character then return true end
+	local humanoid = getHumanoid(character, CHARACTER_WAIT_TIMEOUT)
+	if not humanoid then return false end
+	local backpack = getBackpack(0)
+	if backpack and tool.Parent ~= backpack and tool.Parent ~= character then
+		pcall(function() tool.Parent = backpack end)
+		task.wait(0.05)
+	end
+	pcall(function() humanoid:UnequipTools() end)
+	for _ = 1, 5 do
+		pcall(function() humanoid:EquipTool(tool) end)
+		if tool.Parent ~= character then
+			pcall(function() tool.Parent = character end)
+		end
+		local startedAt = os.clock()
+		while State.Running and os.clock() - startedAt < 0.6 do
+			if tool.Parent == character then
+				task.wait(0.05)
+				return true
+			end
+			task.wait(0.05)
+		end
+	end
+	return tool.Parent == character
+end
+
+local function ownerMatches(plot, ownerName)
+	if not plot then return false end
+	local owner = plot:GetAttribute("Owner")
+	if normalizedContains(owner, ownerName) then return true end
+	local targetPlayer = Players:FindFirstChild(ownerName)
+	local ownerUserId = tonumber(plot:GetAttribute("OwnerUserId"))
+	return targetPlayer and ownerUserId == targetPlayer.UserId
+end
+
+local function findTargetPlot()
+	local ownerNames = getActiveOwnerNames()
+	for _, plot in ipairs(Gardens:GetChildren()) do
+		if plot:IsA("Model") then
+			for _, ownerName in ipairs(ownerNames) do
+				if ownerMatches(plot, ownerName) then
+					lockSelectedOwner(ownerName)
+					return plot, ownerName
+				end
+			end
+		end
+	end
+	for _, ownerName in ipairs(ownerNames) do
+		local targetPlayer = Players:FindFirstChild(ownerName)
+		local plotId = targetPlayer and targetPlayer:GetAttribute("PlotId")
+		if plotId then
+			local plot = Gardens:FindFirstChild("Plot" .. tostring(plotId))
+			if plot then
+				lockSelectedOwner(ownerName)
+				return plot, ownerName
+			end
+		end
+	end
+	return nil
+end
+
+local function getPlotId(plot) return plot and tonumber(tostring(plot.Name):match("%d+")) end
+
+local function getPlantName(plant)
+	return plant:GetAttribute("SeedName")
+		or plant:GetAttribute("PlantName")
+		or plant:GetAttribute("FruitName")
+		or plant:GetAttribute("CorePartName")
+		or plant:GetAttribute("Name")
+		or plant.Name
+end
+
+local function modelPosition(model)
+	if not model then return nil end
+	local ok, pivot = pcall(function() return model:GetPivot() end)
+	if ok and pivot then return pivot.Position end
+	local primary = model:IsA("Model") and model.PrimaryPart
+	if primary then return primary.Position end
+	local part = model:IsA("BasePart") and model or model:FindFirstChildWhichIsA("BasePart", true)
+	return part and part.Position or nil
+end
+
+local function findDragonBreathPlant(plot)
+	local plantsFolder = plot and plot:FindFirstChild("Plants")
+	if not plantsFolder then return nil end
+	local bestPlant
+	local bestDepth = math.huge
+	for _, descendant in ipairs(plantsFolder:GetDescendants()) do
+		if descendant:IsA("Model") or descendant:IsA("Folder") or descendant:IsA("BasePart") then
+			if normalizedContains(getPlantName(descendant), TARGET_PLANT_NAME) then
+				local depth = 0
+				local parent = descendant.Parent
+				while parent and parent ~= plantsFolder do
+					depth += 1
+					parent = parent.Parent
+				end
+				if depth < bestDepth and modelPosition(descendant) then
+					bestDepth = depth
+					bestPlant = descendant
+				end
+			end
+		end
+	end
+	return bestPlant
+end
+
+local function getPlantAreaParts(plot)
+	local parts = {}
+	for _, part in ipairs(CollectionService:GetTagged("PlantArea")) do
+		if part:IsA("BasePart") and part:IsDescendantOf(plot) then table.insert(parts, part) end
+	end
+	if #parts > 0 then return parts end
+	for _, descendant in ipairs(plot:GetDescendants()) do
+		if descendant:IsA("BasePart") and CollectionService:HasTag(descendant, "PlantArea") then
+			table.insert(parts, descendant)
+		end
+	end
+	return parts
+end
+
+local function closestPointOnPart(part, worldPosition)
+	local localPosition = part.CFrame:PointToObjectSpace(worldPosition)
+	local halfSize = part.Size * 0.5
+	local clamped = Vector3.new(
+		math.clamp(localPosition.X, -halfSize.X, halfSize.X),
+		halfSize.Y,
+		math.clamp(localPosition.Z, -halfSize.Z, halfSize.Z)
+	)
+	return part.CFrame:PointToWorldSpace(clamped)
+end
+
+local function projectToPlantArea(plot, position)
+	local parts = getPlantAreaParts(plot)
+	if #parts == 0 then return nil end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = parts
+	local origin = Vector3.new(position.X, position.Y + 150, position.Z)
+	local result = workspace:Raycast(origin, Vector3.new(0, -320, 0), params)
+	if result and result.Instance and result.Instance:IsDescendantOf(plot) then return result.Position end
+	local bestPosition
+	local bestDistance = math.huge
+	for _, part in ipairs(parts) do
+		local candidate = closestPointOnPart(part, position)
+		local distance = (Vector3.new(candidate.X, 0, candidate.Z) - Vector3.new(position.X, 0, position.Z)).Magnitude
+		if distance < bestDistance then
+			bestDistance = distance
+			bestPosition = candidate
+		end
+	end
+	return bestPosition
+end
+
+local function resolveTarget(plot)
+	if State.TargetPlot == plot and State.TargetPlant and State.TargetPlant.Parent and State.TargetPosition then
+		return true
+	end
+	local plant = findDragonBreathPlant(plot)
+	if not plant then return false, TARGET_PLANT_NAME .. " not found in " .. getOwnerLabel() .. "'s plot" end
+	local plantPosition = modelPosition(plant)
+	if not plantPosition then return false, "Dragon's Breath position not found" end
+	local placePosition = projectToPlantArea(plot, plantPosition)
+	if not placePosition then return false, "PlantArea not found near Dragon's Breath" end
+	local direction = Vector3.new(1, 0, 0)
+	local character = getCharacter(0)
+	local root = getRootPart(character, 0)
+	if root then
+		local delta = Vector3.new(root.Position.X - plantPosition.X, 0, root.Position.Z - plantPosition.Z)
+		if delta.Magnitude > 0.05 then direction = delta.Unit end
+	end
+	local nearPosition = projectToPlantArea(plot, plantPosition + (direction * PLACE_OFFSET_DISTANCE)) or placePosition
+	State.TargetPlot = plot
+	State.TargetPlant = plant
+	State.TargetPosition = nearPosition
+	State.WalkPosition = nearPosition + (direction * 5)
+	log(("target ready | plot=%s | plant=%s | place=%.2f, %.2f, %.2f"):format(plot.Name, plant:GetFullName(), nearPosition.X, nearPosition.Y, nearPosition.Z))
+	return true
+end
+
+local function getTweenTargetPosition() return State.WalkPosition or State.TargetPosition end
+
+local function horizontalDistance(a, b)
+	if not (a and b) then return math.huge end
+	return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+end
+
+local function isNearTarget(root)
+	local target = getTweenTargetPosition()
+	return root and target and horizontalDistance(root.Position, target) <= TWEEN_REACHED_DISTANCE
+end
+
+local function getRootTweenPosition(root, humanoid, groundPosition)
+	local heightOffset = 3
+	if humanoid then heightOffset = math.max(heightOffset, tonumber(humanoid.HipHeight) or 0) end
+	if root then heightOffset = math.max(heightOffset, (root.Size.Y * 0.5) + 1) end
+	return Vector3.new(groundPosition.X, groundPosition.Y + heightOffset, groundPosition.Z)
+end
+
+local function tweenToTarget()
+	local character = getCharacter(CHARACTER_WAIT_TIMEOUT)
+	local humanoid = getHumanoid(character, CHARACTER_WAIT_TIMEOUT)
+	local root = getRootPart(character, CHARACTER_WAIT_TIMEOUT)
+	local target = getTweenTargetPosition()
+	if not (humanoid and root and target) then return false, "character not ready" end
+	if humanoid.Health <= 0 then
+		resetLogic("health zero")
+		return false, "character dead"
+	end
+	local token = State.ResetToken
+	if isNearTarget(root) then return true end
+	local rootTarget = getRootTweenPosition(root, humanoid, target)
+	local distance = horizontalDistance(root.Position, target)
+	local speed = math.max(tonumber(humanoid.WalkSpeed) or 16, 1)
+	local duration = math.clamp(distance / speed, 0.05, TWEEN_MAX_SECONDS_PER_MOVE)
+	local lookVector = root.CFrame.LookVector
+	local flatLookVector = Vector3.new(lookVector.X, 0, lookVector.Z)
+	if flatLookVector.Magnitude < 0.05 then flatLookVector = Vector3.new(0, 0, -1) end
+	local targetCFrame = CFrame.new(rootTarget, rootTarget + flatLookVector.Unit)
+	local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut), { CFrame = targetCFrame })
+	tween:Play()
+	local startedAt = os.clock()
+	while State.Running and token == State.ResetToken and os.clock() - startedAt <= duration + 0.5 do
+		if humanoid.Health <= 0 then
+			tween:Cancel()
+			resetLogic("health zero")
+			return false, "character dead"
+		end
+		if isNearTarget(root) then
+			tween:Cancel()
+			return true
+		end
+		task.wait(0.05)
+	end
+	tween:Cancel()
+	return isNearTarget(root), "tween timeout"
+end
+
+local function sprinklersFolder(plot) return plot and plot:FindFirstChild("Sprinklers") end
+
+local function hasSprinklerInPlot(plot)
+	local folder = sprinklersFolder(plot)
+	if not folder then return false end
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:IsA("Model") or child:IsA("BasePart") or child:IsA("Folder") then return true end
+	end
+	return false
+end
+
+local function waitForSprinkler(plot, timeout)
+	local deadline = os.clock() + math.max(tonumber(timeout) or 0, 0)
+	while State.Running and os.clock() < deadline do
+		if hasSprinklerInPlot(plot) then return true end
+		task.wait(0.2)
+	end
+	return hasSprinklerInPlot(plot)
+end
+
+local function placeSprinkler(plot)
+	local tool = requireToolOrRejoin("Sprinkler", SPRINKLER_NAME)
+	if not tool then return false, "missing " .. SPRINKLER_NAME end
+	local plotId = getPlotId(plot)
+	if not plotId then return false, "plot id not found" end
+	equipTool(tool)
+	local ok, err = pcall(function()
+		Networking.Place.PlaceSprinkler:Fire(State.TargetPosition, SPRINKLER_NAME, tool, plotId)
+	end)
+	if not ok then return false, tostring(err) end
+	log(("placed %s near %s"):format(SPRINKLER_NAME, TARGET_PLANT_NAME))
+	waitForSprinkler(plot, 3)
+	return true
+end
+
+local function ensureSprinkler(plot)
+	if hasSprinklerInPlot(plot) then return true end
+	local tweened, tweenMessage = tweenToTarget()
+	if not tweened then return false, tweenMessage end
+	return placeSprinkler(plot)
+end
+
+local function useWateringCan()
+	local tool = requireToolOrRejoin("WateringCan", WATERING_CAN_NAME)
+	if not tool then return false, "missing " .. WATERING_CAN_NAME end
+	local position = State.TargetPosition
+	if not position then return false, "target position not ready" end
+	equipTool(tool)
+	local ok, err = pcall(function()
+		Networking.WateringCan.UseWateringCan:Fire(position - Vector3.new(0, 0.3, 0), WATERING_CAN_NAME, tool)
+	end)
+	if not ok then return false, tostring(err) end
+	log(("watered %s with %s"):format(TARGET_PLANT_NAME, WATERING_CAN_NAME))
+	return true
+end
+
+local function stopCountdown()
+	if countdownThread then
+		task.cancel(countdownThread)
+		countdownThread = nil
+	end
+	CountdownLabel.Text = "WAITING..."
+	CountdownLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+	UIStroke.Color = Color3.fromRGB(60, 60, 60)
+end
+
+local function startCountdown()
+	stopCountdown()
+	countdownThread = task.spawn(function()
+		local timeLeft = rejoinDelay
+		while timeLeft > 0 and ranStatus do
+			Status:SetTitle(string.format("Status : On 🟢 (%ds)", timeLeft))
+			ToggleBtn.Text = string.format("ON (%ds)", timeLeft)
+			CountdownLabel.Text = string.format("REJOIN IN: %ds", timeLeft)
+			if timeLeft <= 10 then
+				CountdownLabel.TextColor3 = Color3.fromRGB(240, 78, 78)
+				UIStroke.Color = Color3.fromRGB(240, 78, 78)
+			else
+				CountdownLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
+				UIStroke.Color = Color3.fromRGB(46, 204, 113)
+			end
+			task.wait(1)
+			timeLeft = timeLeft - 1
+		end
+		if ranStatus then
+			triggerRejoin("Countdown reached zero")
+		end
+	end)
+end
+
+local function waitWithSprinklerMaintenance(plot, seconds)
+	local deadline = os.clock() + seconds
+	while State.Running and os.clock() < deadline do
+		if not ranStatus then break end
+		if inRespawnHold() then
+			task.wait(0.5)
+			continue
+		end
+		if not findTool("Sprinkler", SPRINKLER_NAME, 0) then
+			triggerRejoin(SPRINKLER_NAME .. " depleted")
+			return
+		end
+		if not findTool("WateringCan", WATERING_CAN_NAME, 0) then
+			triggerRejoin(WATERING_CAN_NAME .. " depleted")
+			return
+		end
+		if not hasSprinklerInPlot(plot) then
+			State.IsBusy = true -- กำลังไปจัดการสปริงเกลอร์ (หยุดคลิก)
+			local ready, message = ensureSprinkler(plot)
+			if not ready then setStatus(message or "sprinkler not ready") end
+			State.IsBusy = false
+		end
+		local character = getCharacter(0)
+		local humanoid = getHumanoid(character, 0)
+		local root = getRootPart(character, 0)
+		if humanoid and root and humanoid.Health > 0 and not isNearTarget(root) then
+			State.IsBusy = true -- กำลังเดิน (หยุดคลิก)
+			local tweened, message = tweenToTarget()
+			if not tweened then setStatus(message or "tween failed") end
+			State.IsBusy = false
+		elseif humanoid and humanoid.Health <= 0 then
+			resetLogic("health zero")
+		end
+		task.wait(math.min(SPRINKLER_CHECK_INTERVAL, math.max(0.1, deadline - os.clock())))
+	end
+end
+
+local function turnOnRollback(isAutoRun)
+	if ranStatus then
+		if not isAutoRun then
+			Fluent:Notify({ Title = "Alert", Content = "Rollback is already active", Duration = 5 })
+		end
+	else
+		RemoteEvent:FireServer(buffer.fromstring("6\000\001\255"))
+		ranStatus = true
+		ToggleBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+		startCountdown()
+	end
+end
+
+local function turnOffRollback()
+	stopCountdown()
+	for i = 1, 3 do
+		RemoteEvent:FireServer(buffer.fromstring("6\000\000"))
+		task.wait()
+	end
+	ranStatus = false
+	Status:SetTitle("Status : Off 🔴")
+	ToggleBtn.Text = "Rollback: OFF"
+	ToggleBtn.BackgroundColor3 = Color3.fromRGB(240, 78, 78)
+end
+
+ToggleBtn.MouseButton1Click:Connect(function()
+	if ranStatus then turnOffRollback() else turnOnRollback(false) end
+end)
+
+RejoinBtn.MouseButton1Click:Connect(function() triggerRejoin("Manual Rejoin") end)
+
+Tabs.Main:AddButton({
+	Title = "Turn on",
+	Description = "Turn on rollback & start countdown",
+	Callback = function() turnOnRollback(false) end
+})
+
+Tabs.Main:AddButton({
+	Title = "Turn off",
+	Description = "Turn off rollback & stop countdown",
+	Callback = function() turnOffRollback() end
+})
+
+local RejoinSlider = Tabs.Main:AddSlider("RejoinTimer", {
+	Title = "Auto Rejoin Delay (Seconds)",
+	Description = "Set how long to wait before automatic rejoin",
+	Default = rejoinDelay,
+	Min = 10,
+	Max = 300,
+	Rounding = 0,
+	Callback = function(Value)
+		rejoinDelay = Value
+		if ranStatus then startCountdown() end
+	end
+})
+
+Tabs.Main:AddButton({
+	Title = "Rejoin Now",
+	Description = "Rejoin server immediately",
+	Callback = function() triggerRejoin("UI Manual Request") end
+})
+
+local function wireCharacter(character)
+	task.defer(function()
+		local humanoid = getHumanoid(character, CHARACTER_WAIT_TIMEOUT)
+		if humanoid then
+			connect(humanoid.Died, function() resetLogic("died") end)
+		end
+	end)
+end
+
+connect(LocalPlayer.CharacterAdded, function(character)
+	resetLogic("respawn")
+	wireCharacter(character)
+end)
+
+if LocalPlayer.Character then wireCharacter(LocalPlayer.Character) end
+
+----------------------------------------------------------------
+--- AUTO CLICKER THREAD (ระบบคลิกที่แก้ใหม่)
+----------------------------------------------------------------
+task.spawn(function()
+	while true do
+		-- เงื่อนไขการคลิก: ระบบ Rollback ต้องเปิดอยู่ และ ฟาร์มไม่ได้ยุ่งอยู่ (IsBusy == false)
+		if ranStatus and not State.IsBusy then
+			indicator.BackgroundColor3 = Color3.fromRGB(0, 255, 128) -- จุดสีเขียว = กำลังคลิก
+			
+			local viewportSize = workspace.CurrentCamera.ViewportSize
+			local centerX = viewportSize.X / 2
+			local centerY = viewportSize.Y / 2
+			
+			VirtualInputManager:SendMouseButtonEvent(centerX, centerY, 0, true, game, 0)
+			task.wait()
+			VirtualInputManager:SendMouseButtonEvent(centerX, centerY, 0, false, game, 0)
+			task.wait(CLICK_DELAY)
+		else
+			indicator.BackgroundColor3 = Color3.fromRGB(255, 78, 78) -- จุดสีแดง = หยุดคลิกชั่วคราว
+			task.wait(0.1)
+		end
+	end
+end)
+
+----------------------------------------------------------------
+--- MAIN FARM LOOP
+----------------------------------------------------------------
+task.spawn(function()
+	log("Farm Loop started (Waiting for Rollback Activation)")
+	while State.Running do
+		if not ranStatus or State.Rejoining then
+			task.wait(1)
+			continue
+		end
+
+		if inRespawnGrace() then
+			setStatus(("waiting %.1fs after respawn"):format(math.max(0, State.ResumeAfter - os.clock())))
+			task.wait(math.min(0.5, math.max(0.1, State.ResumeAfter - os.clock())))
+			continue
+		end
+
+		if inRespawnStandWait() then
+			setStatus(("standing %.0fs before loop"):format(math.max(0, State.StandWaitUntil - os.clock())))
+			task.wait(1)
+			continue
+		end
+
+		local sprinklerTool = findTool("Sprinkler", SPRINKLER_NAME, TOOL_WAIT_TIMEOUT)
+		if not sprinklerTool then
+			triggerRejoin(SPRINKLER_NAME .. " depleted")
+			continue
+		end
+
+		local wateringTool = findTool("WateringCan", WATERING_CAN_NAME, TOOL_WAIT_TIMEOUT)
+		if not wateringTool then
+			triggerRejoin(WATERING_CAN_NAME .. " depleted")
+			continue
+		end
+
+		local plot = findTargetPlot()
+		if not plot then
+			setStatus("waiting for plot owner " .. getOwnerLabel())
+			task.wait(3)
+			continue
+		end
+
+		local resolved, resolveMessage = resolveTarget(plot)
+		if not resolved then
+			setStatus(resolveMessage or "target not ready")
+			task.wait(3)
+			continue
+		end
+
+		-- [ช่วงรดน้ำ / วางสปริงเกลอร์] -> ตั้งค่าให้หยุดคลิก
+		State.IsBusy = true 
+
+		local tweened, tweenMessage = tweenToTarget()
+		if not tweened then
+			setStatus(tweenMessage or "tween failed")
+			State.IsBusy = false
+			task.wait(2)
+			continue
+		end
+
+		local sprinklerReady, sprinklerMessage = ensureSprinkler(plot)
+		if not sprinklerReady then
+			setStatus(sprinklerMessage or "sprinkler not ready")
+			State.IsBusy = false
+			task.wait(2)
+			continue
+		end
+
+		local watered, waterMessage = useWateringCan()
+		if not watered then
+			setStatus(waterMessage or "watering failed")
+			State.IsBusy = false
+			task.wait(2)
+			continue
+		end
+
+		-- ทำงานเสร็จสิ้นในรอบนี้แล้ว -> เปิดให้ระบบคลิกกลับมาทำงานต่อ
+		State.IsBusy = false 
+
+		setStatus(("waiting %ds before next water"):format(WATER_INTERVAL))
+		waitWithSprinklerMaintenance(plot, WATER_INTERVAL)
+	end
+	log("stopped")
+end)
+
+task.spawn(function()
+	turnOnRollback(true)
+end)
+
+SaveManager:SetLibrary(Fluent)
+InterfaceManager:SetLibrary(Fluent)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({})
+InterfaceManager:SetFolder("FluentScriptHub")
+SaveManager:SetFolder("FluentScriptHub/specific-game")
+InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+SaveManager:BuildConfigSection(Tabs.Settings)
+
+Window:SelectTab(1)
+
+Fluent:Notify({
+	Title = "Fluent",
+	Content = "The script has been loaded.",
+	Duration = 8
+})
+
+SaveManager:LoadAutoloadConfig()
+task.wait(0.5)
+Window:Minimize()
